@@ -13,16 +13,17 @@ from config import db_uri, keys
 
 db = create_engine(db_uri)
 urls = {'google': 'https://www.googleapis.com/geolocation/v1/geolocate', 'combain': 'https://apiv2.combain.com',
-        'here_old': 'https://positioning.hereapi.com', 'here': 'https://pos.api.here.com/positioning'}
+        'here_old': 'https://positioning.hereapi.com', 'here': 'https://pos.api.here.com/positioning',
+        'opencell': 'http://opencellid.org'}
 
 def decode_cellid(data: list) -> list:
     if len(data) > 0:
         full_list: list = []
         for uli in data:
             cell_id = uli['cell_id']
-            if len(cell_id.strip()) >= 16:
+            if len(cell_id.strip()) >= 16: ##length of cell id has to be equal or greater than 16 chars
                 location: dict = {}
-                binary_string = binascii.unhexlify(cell_id)
+                binary_string = binascii.unhexlify(cell_id) ##parse the cell id
                 location['mcc'] = uli['mcc']
                 location['mnc'] = uli['mnc']
 
@@ -45,7 +46,8 @@ def get_coordinates(api: str, details: list, path: str = 'cell_id.csv'):
     from token_file import token
     location_api: str = urls.get(api)
     if api == 'here':
-        url: str = f'{location_api}/v2/locate'
+        # url: str = f'{location_api}/v2/locate'
+        url: str = f'{location_api}/v1/locate'
     else:
         url: str = f'{location_api}?{keys.get(api)}'
     all_data: list = []
@@ -58,25 +60,33 @@ def get_coordinates(api: str, details: list, path: str = 'cell_id.csv'):
         headers = {'Content-Type': 'application/json'}
         if api == 'here':
             headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {here_token}'}
-        response = requests.post(url, data=data, headers=headers)
 
-        if response.status_code == 401:
-            response, here_token = generate_here_token(url, data, headers)
-
-        if response.status_code == 200:
-            coordinates = json.loads(response.text)
-            info['latitude'] = coordinates['location']['lat']
-            info['longitude'] = coordinates['location']['lng']
-            info['accuracy'] = coordinates.get('accuracy') or coordinates['location']['accuracy']
-            info['location_api'] = location_api
-            success += 1
+        if api == 'opencell':
+           opencell_return = opencell(location_api, data)
+           if opencell_return is not None:
+               info['latitude'] = opencell_return['lat']
+               info['longitude'] = opencell_return['lon']
+               info['location_api'] = location_api
+               success += 1
 
         else:
-            info['latitude'] = '0.0'
-            info['longitude'] = '0.0'
-            info['accuracy'] = '0.0'
-            info['location_api'] = location_api
+            response = requests.post(url, data=data, headers=headers)
+            if response.status_code == 401:
+                response, here_token = generate_here_token(url, data, headers)
 
+            if response.status_code == 200:
+                coordinates = json.loads(response.text)
+                info['latitude'] = coordinates['location']['lat']
+                info['longitude'] = coordinates['location']['lng']
+                info['accuracy'] = coordinates.get('accuracy') or coordinates['location']['accuracy']
+                info['location_api'] = location_api
+                success += 1
+
+            else:
+                info['latitude'] = '0.0'
+                info['longitude'] = '0.0'
+                info['accuracy'] = '0.0'
+        info['location_api'] = location_api
         info['date_updated'] = date.today()
         all_data.append(info)
         total += 1
@@ -85,6 +95,17 @@ def get_coordinates(api: str, details: list, path: str = 'cell_id.csv'):
                                          'location_api', 'accuracy', 'date_updated'])
     df.to_csv(path, index=False)
     return all_data
+
+def opencell(location_api, data):
+    url: str = f'{location_api}/cell/get'
+    headers = {'Content-Type': 'application/json;charset=UTF-8'}
+    response = requests.get(url, params=data, headers=headers)
+    coordinates = json.loads(response.text)
+    if 'error' in coordinates.keys():
+        return None
+    else:
+        return coordinates
+
 
 def generate_here_token(url, data, headers):
     get_token()
@@ -122,6 +143,16 @@ def get_data_structure(api: str, info:dict) -> json:
                     ]
                 }
             )
+    elif api == 'opencell':
+        data = {
+                "key": keys.get(api),
+                "mcc": info.get('mcc'),
+                "mnc": info.get('mnc'),
+                "lac": info.get('lac'),
+                "cellid": info.get('ci'),
+                "radio": info.get('radiotype').upper(),
+                "format": "json",
+            }
     else:
         data = json.dumps(
             {
@@ -139,10 +170,10 @@ def get_data_structure(api: str, info:dict) -> json:
         )
     return data
 
-def to_db(data: list, db=db):
+def to_db(data: list, db=db, db_name='cellid_location_opencell'):
     df = pd.DataFrame(data, columns=['mnc', 'mcc', 'lac', 'ci', 'cell_id', 'radiotype', 'latitude', 'longitude',
                                      'location_api', 'accuracy', 'date_updated'])
-    df.to_sql('cellid_location_here', db, if_exists='append', index=False)
+    df.to_sql(db_name, db, if_exists='append', index=False)
     return None
 
 def from_csv(path, delimiter=None, *args):
@@ -160,7 +191,7 @@ def from_db(query, batch_size, start, db=db):
         yield batch
     return None
 
-def run_batch(api:str, limit = None, start:int = 0, step: int = 100):
+def run_batch(api:str, limit = None, start:int = 0, step: int = 100, query:str = None):
     #here.mnc, here.mcc, here.cell_id, here.radiotype,
     """query = f
         SELECT  google.mnc, google.mcc, google.cell_id
@@ -168,16 +199,24 @@ def run_batch(api:str, limit = None, start:int = 0, step: int = 100):
         WHERE google.radiotype = 'lte'
         LIMIT {limit}
         """
-    query = f"""
-    SELECT mnc, mcc, cell_id FROM geo.cellid_location where location_api != 'https://apiv2.combain.com'
+    # query_default = f"""
+    # SELECT mnc, mcc, cell_id FROM geo.cellid_location where location_api != 'https://apiv2.combain.com'
+    # """
+    query_default = f"""
+     SELECT DISTINCT aff.mnc, aff.mcc, aff.cell_id, open.cell_id as open_cell_id FROM geolocation.agg_cdr_affluences aff
+    LEFT JOIN geolocation.cellid_location_opencell open ON aff.cell_id = open.cell_id
+    AND aff.mnc = open.mnc AND aff.mcc = open.mcc
+    WHERE open.cell_id = ''
     """
+
+    final_query = query_default if query is None else query
     start_time = time.time()
     lap_time = start_time
-    results = from_db(query, batch_size=step, start=start)
+    results = from_db(final_query, batch_size=step, start=start)
     counter = start
     for data in results:
         decoded = decode_cellid(data)
-        coordinates_db = get_coordinates(api, decoded, 'csvs/google_db_result.csv')
+        coordinates_db = get_coordinates(api, decoded, 'csvs/result_opencell_main.csv')
         to_db(coordinates_db)
         counter += len(data)
         if not limit:
@@ -190,4 +229,4 @@ def run_batch(api:str, limit = None, start:int = 0, step: int = 100):
 
 
 if __name__ == '__main__':
-    run_batch(api='here', start=0, step=200)
+    run_batch(api='opencell', start=0, step=20)
